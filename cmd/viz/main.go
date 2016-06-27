@@ -2,7 +2,9 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -12,12 +14,16 @@ import (
 func main() {
 	var port string
 
-	flag.StringVar(&port, "http", ":6000", "http port to listen on")
+	flag.StringVar(&port, "http", ":8080", "http port to listen on")
 
 	flag.Parse()
 
 	http.Handle("/viz", http.HandlerFunc(valHandler))
-	http.Handle("/struct", http.HandlerFunc(testing))
+	http.Handle("/struct", http.HandlerFunc(structs))
+	http.Handle("/slice", http.HandlerFunc(slice))
+
+	log.Printf("listening on %s", port)
+
 	err := http.ListenAndServe(port, nil)
 	if err != nil {
 		log.Fatal("ListenAndServe:", err)
@@ -32,29 +38,29 @@ func valHandler(w http.ResponseWriter, req *http.Request) {
 			w.WriteHeader(400)
 			return
 		}
-		marshalTo(w, i)
+		marshalTo(w, 96, i)
 	case "float":
 		f, err1 := strconv.ParseFloat(req.FormValue("v"), 64)
 		if err1 != nil {
 			w.WriteHeader(400)
 			return
 		}
-		marshalTo(w, f)
+		marshalTo(w, 96, f)
 	case "bool":
 		b, err1 := strconv.ParseBool(req.FormValue("v"))
 		if err1 != nil {
 			w.WriteHeader(400)
 			return
 		}
-		marshalTo(w, b)
+		marshalTo(w, 96, b)
 	default:
 		w.WriteHeader(400)
 		return
 	}
 }
 
-func marshalTo(w http.ResponseWriter, i interface{}) {
-	b, errMarshal := kandinsky.Marshal(i, 96)
+func marshalTo(w http.ResponseWriter, sz float64, i interface{}) {
+	b, errMarshal := kandinsky.Marshal(i, sz)
 	if errMarshal != nil {
 		log.Print(errMarshal)
 		w.WriteHeader(500)
@@ -69,7 +75,7 @@ func marshalTo(w http.ResponseWriter, i interface{}) {
 	}
 }
 
-func testing(w http.ResponseWriter, req *http.Request) {
+func structs(w http.ResponseWriter, req *http.Request) {
 	var s struct {
 		X int
 		Y float64
@@ -82,5 +88,43 @@ func testing(w http.ResponseWriter, req *http.Request) {
 	s.Z = true
 	s.s = 11235813
 
-	marshalTo(w, s)
+	marshalTo(w, 96, s)
+}
+
+func slice(w http.ResponseWriter, req *http.Request) {
+	type inner struct {
+		Bs   []bool
+		Strs []string
+		F    float64
+	}
+
+	type obj struct {
+		X int
+		F float64
+		W string
+		I inner
+	}
+
+	var s []obj
+
+	for i := 0; i < 64; i++ {
+		var iObj inner
+		xor := i ^ (i >> 1)
+		for j := 0; j < 8; j++ {
+			b := (xor & 1) == 0
+			iObj.Bs = append(iObj.Bs, b)
+			iObj.Strs = append(iObj.Strs, fmt.Sprintf("%v", b))
+			xor = xor >> 1
+		}
+		iObj.F = math.Cos(float64(i) / 2.0)
+		o := obj{
+			X: i,
+			F: math.Sin(float64(i) / 4.0),
+			W: fmt.Sprintf("%d", i),
+			I: iObj,
+		}
+		s = append(s, o)
+	}
+
+	marshalTo(w, 900, s)
 }

@@ -3,7 +3,6 @@ package kandinsky
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"math"
 	"reflect"
 	"sync"
@@ -23,7 +22,8 @@ func Marshal(i interface{}, size float64) ([]byte, error) {
 	var b bytes.Buffer
 
 	s := gosvg.NewSVG(size, size)
-	e := &encodeState{SVG: s, size: size}
+	g := s.Group()
+	e := &encodeState{Group: g, size: size}
 
 	err := e.marshal(reflect.ValueOf(i))
 	if err != nil {
@@ -37,8 +37,8 @@ func Marshal(i interface{}, size float64) ([]byte, error) {
 
 // encodeState encodes data into a bytes.Buffer.
 type encodeState struct {
-	*gosvg.SVG // accumulated output
-	size       float64
+	*gosvg.Group // accumulated output
+	size         float64
 }
 
 func (e *encodeState) marshal(v reflect.Value) error {
@@ -85,12 +85,18 @@ func newTypeEncoder(t reflect.Type) (encoderFunc, error) {
 	switch t.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return intEncoder, nil
+	case reflect.Uint8:
+		return byteEncoder, nil
 	case reflect.Float32, reflect.Float64:
 		return floatEncoder, nil
 	case reflect.Bool:
 		return boolEncoder, nil
+	case reflect.String:
+		return stringEncoder, nil
 	case reflect.Struct:
 		return structEncoder, nil
+	case reflect.Slice:
+		return sliceEncoder, nil
 	default:
 		return nil, UnsupportedTypeError{t: t}
 	}
@@ -101,6 +107,7 @@ var encoderCache struct {
 	sync.RWMutex
 }
 
+// we try to cache types here because building encoders is expensive.
 func typeEncoder(t reflect.Type) (encoderFunc, error) {
 	encoderCache.RLock()
 	f := encoderCache.m[t]
@@ -115,6 +122,7 @@ func typeEncoder(t reflect.Type) (encoderFunc, error) {
 		return nil, err
 	}
 
+	// lock the cache and initialize it
 	encoderCache.Lock()
 	if encoderCache.m == nil {
 		encoderCache.m = make(map[reflect.Type]encoderFunc)
@@ -126,6 +134,9 @@ func typeEncoder(t reflect.Type) (encoderFunc, error) {
 	return f, nil
 }
 
+// ints in kandinsky encode as 8x8 (64-bit) matrices. MSB
+// is at the top left, LSB is in the lower right. positive
+// integers are rendered in black and negative in red.
 func intEncoder(e *encodeState, v reflect.Value) error {
 	sz := e.size
 	val := int(v.Int())
@@ -135,13 +146,16 @@ func intEncoder(e *encodeState, v reflect.Value) error {
 		color = "red"
 		val = -val
 	}
-	cellSz := (sz / 8) - 1
+	factor := .1
+	cellSz := (sz / 8)
+	blkSz := cellSz * (1 - factor)
+	margin := cellSz * (factor / 2)
 
-	for y := sz - cellSz - 1; y >= 0; y -= (cellSz + 1) {
-		for x := sz - cellSz - 1; x >= 0; x -= (cellSz + 1) {
+	for y := sz - cellSz; y > 0; y -= cellSz {
+		for x := sz - cellSz; x > 0; x -= cellSz {
 			bit := val % 2
 			if bit == 1 {
-				r := e.Rect(x, y, cellSz, cellSz)
+				r := e.Rect(x+margin, y-margin, blkSz, blkSz)
 				r.Style.Set("stroke-width", "0")
 				r.Style.Set("fill", color)
 			}
@@ -155,6 +169,40 @@ func intEncoder(e *encodeState, v reflect.Value) error {
 	return nil
 }
 
+// bytes render as a set of up to 8 stacked bars.
+func byteEncoder(e *encodeState, v reflect.Value) error {
+	val := v.Uint()
+	sz := e.size
+	h := sz / 8.0
+	factor := .2
+	blkH := h * (1 - factor)
+	margin := h * (factor / 2)
+
+	for y := sz - h; y > 0; y -= h {
+		bit := val % 2
+		if bit == 1 {
+			r := e.Rect(margin, y-margin, sz-margin, blkH)
+			r.Style.Set("stroke-width", "0")
+			r.Style.Set("fill", "black")
+		}
+		val = val >> 1
+		if val == 0 {
+			return nil
+		}
+	}
+
+	return nil
+}
+
+// strings render as a slice of bytes.
+func stringEncoder(e *encodeState, v reflect.Value) error {
+	b := reflect.ValueOf([]byte(v.String()))
+
+	return e.marshal(b)
+}
+
+// floats currently only render in [-1, 1] as a circle filling a
+// proportionate amount of the alloted space.
 func floatEncoder(e *encodeState, v reflect.Value) error {
 	sz := e.size
 	val := float64(v.Float())
@@ -175,35 +223,38 @@ func floatEncoder(e *encodeState, v reflect.Value) error {
 	return nil
 }
 
+// bools render as a triangle pointing up for true and down for
+// false.
 func boolEncoder(e *encodeState, v reflect.Value) error {
 	sz := e.size
+	factor := .25
+	factorD2 := factor / 2
+	h := sz * (1 - factor)
 
 	val := v.Bool()
-	sz = sz - 2
 
-	// y = sin(1/3 * pi)*sz for making equilateral triangle
-	sinY := 0.866 * sz
-	margin := (sz - sinY) / 2
+	// y = sin(1/3 * pi)*h for making equilateral triangle
+	sinY := 0.866 * h
 
-	x1, x2, x3 := 1.0, sz/2, sz+1
-	y1, y2, y3 := sinY, 0.0, sinY
+	x1, x2, x3 := sz*factorD2, sz/2, sz*(1-factorD2)
+	hi, lo := sinY+x1, x1
 
 	if val == false {
-		y1, y2, y3 = 0, sinY, 0
+		hi, lo = lo, hi
 	}
 
-	pts := []gosvg.Point{{x1, y1}, {x2, y2}, {x3, y3}}
-	g := e.Group()
-	g.Transform.Translate(0, margin)
-	p := g.Polygon(pts...)
+	pts := []gosvg.Point{{x1, lo}, {x2, hi}, {x3, lo}}
+	p := e.Polygon(pts...)
 	p.Style.Set("stroke-width", "0")
 	p.Style.Set("fill", "black")
 
 	return nil
 }
 
+// structEncoder renders the fields of the struct in order of their
+// declaration in source. fields are displayed in a square grid which
+// is guaranteed to have enough cells to render all fields.
 func structEncoder(e *encodeState, v reflect.Value) error {
-	log.Printf("got struct %#v", v)
 	sz := e.size
 
 	t := v.Type()
@@ -216,21 +267,70 @@ func structEncoder(e *encodeState, v reflect.Value) error {
 
 	width := int(math.Ceil(math.Sqrt(float64(numFields))))
 	cellSz := sz / float64(width)
+	cellPt := 1 / float64(width)
 
 	x := 0
 	y := 0
-	g := e.Group()
+	g := e.Group.Group()
 	for i := 0; i < numFields; i++ {
 		xF := float64(x) * cellSz
 		yF := float64(y) * cellSz
-		s := g.SVG(xF, yF, cellSz, cellSz)
+		s := g.Group()
+		s.Transform.Translate(xF, yF)
+		s.Transform.Scale(cellPt, cellPt)
 
 		enc := &encodeState{
-			SVG:  s,
-			size: cellSz,
+			Group: s,
+			size:  sz,
 		}
 
 		errMarshal := enc.marshal(v.Field(i))
+		if errMarshal != nil {
+			return errMarshal
+		}
+
+		x++
+		if x == width {
+			y++
+			x = 0
+		}
+	}
+
+	return nil
+}
+
+// sliceEncoder acts similarly to structEncoder, except instead of rendering
+// fields in each grid cell the encoder renders indexes.
+func sliceEncoder(e *encodeState, v reflect.Value) error {
+	sz := e.size
+
+	length := v.Len()
+
+	// short circuit if length is 0
+	if length == 0 {
+		return nil
+	}
+
+	width := int(math.Ceil(math.Sqrt(float64(length))))
+	cellSz := sz / float64(width)
+	cellPt := 1 / float64(width)
+
+	x := 0
+	y := 0
+	g := e.Group.Group()
+	for i := 0; i < length; i++ {
+		xF := float64(x) * cellSz
+		yF := float64(y) * cellSz
+		s := g.Group()
+		s.Transform.Translate(xF, yF)
+		s.Transform.Scale(cellPt, cellPt)
+
+		enc := &encodeState{
+			Group: s,
+			size:  sz,
+		}
+
+		errMarshal := enc.marshal(v.Index(i))
 		if errMarshal != nil {
 			return errMarshal
 		}
