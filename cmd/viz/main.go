@@ -103,11 +103,12 @@ func slice(w http.ResponseWriter, req *http.Request) {
 		F float64
 		W string
 		I inner
+		M map[int][]int
 	}
 
 	var s []obj
 
-	for i := 0; i < 64; i++ {
+	for i := 0; i < 16; i++ {
 		var iObj inner
 		xor := i ^ (i >> 1)
 		for j := 0; j < 8; j++ {
@@ -117,11 +118,20 @@ func slice(w http.ResponseWriter, req *http.Request) {
 			xor = xor >> 1
 		}
 		iObj.F = math.Cos(float64(i) / 2.0)
+		m := make(map[int][]int)
+		for j := 0; j < i; j++ {
+			var js = make([]int, j)
+			for k := 0; k < j; k++ {
+				js[k] = k
+			}
+			m[j] = js
+		}
 		o := obj{
 			X: i,
 			F: math.Sin(float64(i) / 4.0),
 			W: fmt.Sprintf("%d", i),
 			I: iObj,
+			M: m,
 		}
 		s = append(s, o)
 	}

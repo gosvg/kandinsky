@@ -59,7 +59,7 @@ type UnsupportedTypeError struct {
 }
 
 func (e UnsupportedTypeError) Error() string {
-	return fmt.Sprintf("goviz: unsupported type %s", e.t.String())
+	return fmt.Sprintf("goviz: unsupported type %s (kind %s)", e.t.String(), e.t.Kind())
 }
 
 // InvalidValueError represents an error condition where the given value for a type
@@ -69,12 +69,12 @@ type InvalidValueError struct {
 }
 
 func (e InvalidValueError) Error() string {
-	t := e.v.Type()
-	return fmt.Sprintf("goviz: invalid value %s for type %s", e.v.String, t.String())
+	return fmt.Sprintf("goviz: invalid value %s", e.v.String())
 }
 
 func valueEncoder(v reflect.Value) (encoderFunc, error) {
 	if !v.IsValid() {
+		panic(InvalidValueError{v: v})
 		return nil, InvalidValueError{v: v}
 	}
 
@@ -97,6 +97,12 @@ func newTypeEncoder(t reflect.Type) (encoderFunc, error) {
 		return structEncoder, nil
 	case reflect.Slice:
 		return sliceEncoder, nil
+	case reflect.Map:
+		return mapEncoder, nil
+	case reflect.Interface:
+		return ifaceEncoder, nil
+	case reflect.Ptr:
+		return ptrEncoder, nil
 	default:
 		return nil, UnsupportedTypeError{t: t}
 	}
@@ -132,6 +138,18 @@ func typeEncoder(t reflect.Type) (encoderFunc, error) {
 	encoderCache.Unlock()
 
 	return f, nil
+}
+
+func ifaceEncoder(e *encodeState, v reflect.Value) error {
+	return e.marshal(v.Elem())
+}
+
+func ptrEncoder(e *encodeState, v reflect.Value) error {
+	elem := v.Elem()
+	if !elem.IsValid() {
+		return nil
+	}
+	return e.marshal(elem)
 }
 
 // ints in kandinsky encode as 8x8 (64-bit) matrices. MSB
@@ -230,6 +248,7 @@ func boolEncoder(e *encodeState, v reflect.Value) error {
 	factor := .25
 	factorD2 := factor / 2
 	h := sz * (1 - factor)
+	color := "black"
 
 	val := v.Bool()
 
@@ -237,16 +256,17 @@ func boolEncoder(e *encodeState, v reflect.Value) error {
 	sinY := 0.866 * h
 
 	x1, x2, x3 := sz*factorD2, sz/2, sz*(1-factorD2)
-	hi, lo := sinY+x1, x1
+	hi, lo := x1, sinY+x1
 
 	if val == false {
 		hi, lo = lo, hi
+		color = "red"
 	}
 
 	pts := []gosvg.Point{{x1, lo}, {x2, hi}, {x3, lo}}
 	p := e.Polygon(pts...)
 	p.Style.Set("stroke-width", "0")
-	p.Style.Set("fill", "black")
+	p.Style.Set("fill", color)
 
 	return nil
 }
@@ -297,6 +317,47 @@ func structEncoder(e *encodeState, v reflect.Value) error {
 	}
 
 	return nil
+}
+
+// mapEncoder encodes maps as a slice of key-value pairs.
+func mapEncoder(e *encodeState, v reflect.Value) error {
+	type kvPair struct {
+		k1 interface{}
+		v1 interface{}
+		k2 interface{}
+		v2 interface{}
+	}
+
+	keys := v.MapKeys()
+	kvPairs := make([]kvPair, 0, (len(keys)+1)/2)
+
+	if len(keys) == 0 {
+		return nil
+	}
+
+	var (
+		p     kvPair
+		isOdd bool
+	)
+
+	for _, k := range keys {
+		val := v.MapIndex(k)
+		if !isOdd {
+			p.k1, p.v1 = k.Interface(), val.Interface()
+		} else {
+			p.k2, p.v2 = k.Interface(), val.Interface()
+			kvPairs = append(kvPairs, p)
+		}
+
+		isOdd = !isOdd
+	}
+
+	if !isOdd {
+		kvPairs = append(kvPairs, p)
+	}
+
+	return sliceEncoder(e, reflect.ValueOf(kvPairs))
+
 }
 
 // sliceEncoder acts similarly to structEncoder, except instead of rendering
